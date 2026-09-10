@@ -28,8 +28,8 @@ environments:
     user: readonly
     # Three ways to supply the password, in order of preference:
     #   password_command: "op read op://work/db-prod/password"   # never on disk
-    #   password: ${ACME_PROD_PASSWORD}                          # from the environment
-    #   password: "literal"                                      # last resort
+    #   password_env: ACME_PROD_PASSWORD                         # from the environment
+    #   password: "literal"                                      # used exactly as written
     password_command: "echo change-me"
     limit: 200        # default rows per query
     max_limit: 5000   # ceiling for --limit
@@ -38,7 +38,7 @@ environments:
   staging:
     host: db-staging.example.internal
     user: readonly
-    password: ${ACME_STAGING_PASSWORD}
+    password_env: ACME_STAGING_PASSWORD
     limit: 2000
 
 schemas:

@@ -130,7 +130,8 @@ schemas:
     host: analytics-db.internal    # overrides only what differs
 ```
 
-Passwords resolve in this order: the schema's `password`/`password_command`,
-the environment's, then `SVIDOQ_PASSWORD_<ENV>`. A literal `password` goes
-through environment expansion, so it can hold `${VAR}` instead of the secret.
-A schema may set `url:` to supply a full DSN and bypass composition entirely.
+Passwords resolve in this order: the schema's, then the environment's, then
+`SVIDOQ_PASSWORD_<ENV>`. At each level: `password` (a literal, used exactly as
+written), `password_env` (the name of an environment variable), or
+`password_command` (its stdout). Nothing is expanded, so a `$` in a password is
+a `$`. A schema may set `url:` for a full DSN, bypassing composition entirely.
