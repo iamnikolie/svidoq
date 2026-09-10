@@ -22,8 +22,9 @@ var (
 
 // DB is a read-only MySQL/MariaDB datasource.
 type DB struct {
-	name string
-	db   *sql.DB
+	name      string
+	db        *sql.DB
+	multiStmt bool
 }
 
 // Open dials a DSN. It does not contact the server; the first query does.
@@ -37,6 +38,16 @@ func Open(name, dsn string, connectTimeout time.Duration) (*DB, error) {
 		cfg.Timeout = connectTimeout
 	}
 
+	// Refuse multi-statement mode whatever the DSN asked for. The validator
+	// already rejects two statements in one call, but a driver that cannot
+	// send them is a second wall that no future code path can walk around —
+	// and a read-only tool has no use for the feature.
+	cfg.MultiStatements = false
+
+	// Interpolation would build the final SQL client-side, out of reach of the
+	// server's own parsing. Keep statements going over the wire as written.
+	cfg.InterpolateParams = false
+
 	connector, err := mysqldriver.NewConnector(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("build connector: %w", err)
@@ -48,8 +59,12 @@ func Open(name, dsn string, connectTimeout time.Duration) (*DB, error) {
 	db.SetMaxOpenConns(2)
 	db.SetMaxIdleConns(1)
 
-	return &DB{name: name, db: db}, nil
+	return &DB{name: name, db: db, multiStmt: cfg.MultiStatements}, nil
 }
+
+// multiStatements reports the setting the pool was actually opened with, so a
+// test can assert the DSN could not re-enable it.
+func (d *DB) multiStatements() bool { return d.multiStmt }
 
 // Name returns the configured schema name.
 func (d *DB) Name() string { return d.name }
