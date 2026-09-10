@@ -1,0 +1,31 @@
+name: Bug report
+description: Something the CLI does wrong
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran, what you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `svidoq version`.
+    validations:
+      required: true
+
+  - type: textarea
+    id: verbose
+    attributes:
+      label: Verbose output
+      description: >
+        Output of the same command with `--verbose`, if you can share it.
+        Redact hostnames, tokens and anything sensitive — this is a public
+        issue tracker.
+      render: text
+    validations:
+      required: false
