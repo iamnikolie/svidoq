@@ -60,6 +60,7 @@ type Schema struct {
 	Port            int    `yaml:"port"`
 	User            string `yaml:"user"`
 	Password        string `yaml:"password"`
+	PasswordEnv     string `yaml:"password_env"`
 	PasswordCommand string `yaml:"password_command"`
 	Params          string `yaml:"params"`
 
@@ -75,6 +76,7 @@ type Environment struct {
 	Port            int    `yaml:"port"`
 	User            string `yaml:"user"`
 	Password        string `yaml:"password"`
+	PasswordEnv     string `yaml:"password_env"`
 	PasswordCommand string `yaml:"password_command"`
 	Params          string `yaml:"params"`
 
@@ -326,7 +328,7 @@ func (c *Config) Resolve(env, schema string) (*Target, error) {
 	}
 
 	if s.URL != "" {
-		t.DSN = os.ExpandEnv(s.URL)
+		t.DSN = s.URL
 		t.Display = redactDSN(t.DSN)
 
 		return t, nil
@@ -357,16 +359,32 @@ func (c *Config) Resolve(env, schema string) (*Target, error) {
 	return t, nil
 }
 
-// resolvePassword prefers, in order: the schema's literal or command, the
-// environment's, then SVIDOQ_PASSWORD_<ENV>. Literals go through os.ExpandEnv
-// so a config can carry ${VAR} instead of the secret itself.
+// resolvePassword prefers, in order: the schema's password, then the
+// environment's, then SVIDOQ_PASSWORD_<ENV>. Within each level: a literal, an
+// environment variable named by password_env, or the output of
+// password_command.
+//
+// A literal is used exactly as written — no variable expansion. Expanding it
+// would silently truncate every password containing a dollar sign, which is a
+// very ordinary thing for a generated password to contain. Sourcing from the
+// environment is therefore its own explicit field rather than a syntax hidden
+// inside the value.
 func resolvePassword(s Schema, e Environment, envName string) (string, error) {
-	for _, src := range []struct{ literal, command string }{
-		{s.Password, s.PasswordCommand},
-		{e.Password, e.PasswordCommand},
+	for _, src := range []struct{ literal, fromEnv, command string }{
+		{s.Password, s.PasswordEnv, s.PasswordCommand},
+		{e.Password, e.PasswordEnv, e.PasswordCommand},
 	} {
 		if src.literal != "" {
-			return os.ExpandEnv(src.literal), nil
+			return src.literal, nil
+		}
+
+		if src.fromEnv != "" {
+			v := os.Getenv(src.fromEnv)
+			if v == "" {
+				return "", fmt.Errorf("%w: password_env names %s, which is empty or unset", ErrIncomplete, src.fromEnv)
+			}
+
+			return v, nil
 		}
 
 		if src.command != "" {
@@ -413,6 +431,7 @@ func mergeSchema(base, override Schema) Schema {
 	out.Host = firstNonEmpty(override.Host, base.Host)
 	out.User = firstNonEmpty(override.User, base.User)
 	out.Password = firstNonEmpty(override.Password, base.Password)
+	out.PasswordEnv = firstNonEmpty(override.PasswordEnv, base.PasswordEnv)
 	out.PasswordCommand = firstNonEmpty(override.PasswordCommand, base.PasswordCommand)
 	out.Params = firstNonEmpty(override.Params, base.Params)
 	out.URL = firstNonEmpty(override.URL, base.URL)

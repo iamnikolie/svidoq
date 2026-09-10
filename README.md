@@ -112,7 +112,7 @@ environments:
   staging:
     host: db-staging.internal
     user: readonly
-    password: ${ACME_STAGING_PASSWORD}
+    password_env: ACME_STAGING_PASSWORD
 
 schemas:
   billing:
@@ -124,8 +124,10 @@ schemas:
 
 Nothing about your workspaces lives in this repository, and the password need
 not live on disk: `password_command` reads it from a secret manager at query
-time, `${VAR}` takes it from the environment, and `SVIDOQ_PASSWORD_<ENV>` is
-the last fallback. The file is created 0600.
+time, `password_env` names an environment variable, and `SVIDOQ_PASSWORD_<ENV>`
+is the last fallback. A literal `password` is used exactly as written — nothing
+is expanded, so a `$` in a generated password stays a `$`. The file is created
+0600.
 
 There is deliberately **no default profile**: `--config` (or `SVIDOQ_CONFIG`)
 is required, so a command cannot quietly hit production because a stray DSN was

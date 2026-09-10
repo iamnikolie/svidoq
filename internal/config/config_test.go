@@ -110,7 +110,7 @@ environments:
   prod:
     host: h
     user: u
-    password: ${ACME_PW}
+    password_env: ACME_PW
 schemas:
   billing: {}
 `)
@@ -123,6 +123,71 @@ schemas:
 	require.NoError(t, err)
 
 	assert.Contains(t, target.DSN, ":from-env@")
+}
+
+func TestPasswordEnvPointingAtNothingIsAnError(t *testing.T) {
+	p := write(t, "acme", `
+default_env: prod
+environments:
+  prod:
+    host: h
+    user: u
+    password_env: ACME_PW_UNSET
+schemas:
+  billing: {}
+`)
+
+	cfg, err := Load(p)
+	require.NoError(t, err)
+
+	_, err = cfg.Resolve("", "billing")
+	require.ErrorIs(t, err, ErrIncomplete, "a dangling password_env must fail loudly, not connect without a password")
+}
+
+// A literal password is used exactly as written. Expanding it would truncate
+// every password containing a dollar sign — an entirely ordinary character in
+// a generated password, and the bug that this test exists to prevent.
+func TestLiteralPasswordIsNotExpanded(t *testing.T) {
+	p := write(t, "acme", `
+default_env: prod
+environments:
+  prod:
+    host: h
+    user: u
+    password: "aA1$bC2dE3f"
+schemas:
+  billing: {}
+`)
+	t.Setenv("bC2dE3f", "SHOULD-NOT-APPEAR")
+
+	cfg, err := Load(p)
+	require.NoError(t, err)
+
+	target, err := cfg.Resolve("", "billing")
+	require.NoError(t, err)
+
+	assert.Contains(t, target.DSN, ":aA1$bC2dE3f@")
+	assert.NotContains(t, target.DSN, "SHOULD-NOT-APPEAR")
+}
+
+// The same hazard through the full-DSN escape hatch.
+func TestURLIsNotExpanded(t *testing.T) {
+	p := write(t, "acme", `
+default_env: prod
+environments:
+  prod: {host: h, user: u}
+schemas:
+  legacy:
+    url: "u:pa$$word@tcp(1.2.3.4:3306)/legacy?parseTime=true"
+`)
+
+	cfg, err := Load(p)
+	require.NoError(t, err)
+
+	target, err := cfg.Resolve("", "legacy")
+	require.NoError(t, err)
+
+	assert.Equal(t, "u:pa$$word@tcp(1.2.3.4:3306)/legacy?parseTime=true", target.DSN)
 }
 
 func TestPasswordFromCommand(t *testing.T) {
