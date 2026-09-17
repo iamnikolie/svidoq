@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -83,6 +84,12 @@ type Environment struct {
 	Limit    int           `yaml:"limit"`
 	MaxLimit int           `yaml:"max_limit"`
 	Timeout  time.Duration `yaml:"timeout"`
+
+	// Discover makes every database the server shows this user a schema, with
+	// no entry per database: the grant, not the file, decides what is
+	// readable, so a database created tomorrow needs no config edit. Listed
+	// schemas still contribute descriptions and overrides.
+	Discover bool `yaml:"discover"`
 
 	// Schemas overrides top-level schema entries for this environment only.
 	Schemas map[string]Schema `yaml:"schemas"`
@@ -289,6 +296,64 @@ func (c *Config) environment(requested string) (Environment, string, error) {
 	return e, name, nil
 }
 
+// Discovers reports whether an environment lists its schemas from the server.
+func (c *Config) Discovers(env string) bool {
+	e, _, err := c.environment(env)
+
+	return err == nil && e.Discover
+}
+
+// systemSchemas are the server's own databases. Discovery never lists them:
+// they are not what a workspace is about.
+var systemSchemas = map[string]bool{
+	"information_schema": true,
+	"mysql":              true,
+	"performance_schema": true,
+	"sys":                true,
+}
+
+// plainDatabaseName is what discovery will dial. A discovered name comes from
+// the command line and lands in the DSN path, so anything that could end that
+// path — "?", "/", ")" — and smuggle in driver parameters is refused outright.
+var plainDatabaseName = regexp.MustCompile(`^[A-Za-z0-9_$-]{1,64}$`)
+
+// WithDiscovered returns the environment's schema names merged with the
+// databases the server listed, sorted. A database already reachable through a
+// configured schema — by name or through its database field — is not listed
+// twice, and system schemas are dropped.
+func (c *Config) WithDiscovered(env string, databases []string) ([]string, error) {
+	names, err := c.SchemaNames(env)
+	if err != nil {
+		return nil, err
+	}
+
+	e, _, err := c.environment(env)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := map[string]bool{}
+
+	for _, n := range names {
+		seen[n] = true
+		seen[mergeSchema(c.Schemas[n], e.Schemas[n]).Database] = true
+	}
+
+	for _, db := range databases {
+		if seen[db] || systemSchemas[db] || !plainDatabaseName.MatchString(db) {
+			continue
+		}
+
+		seen[db] = true
+
+		names = append(names, db)
+	}
+
+	sort.Strings(names)
+
+	return names, nil
+}
+
 // Resolve produces the connection target for one schema in one environment.
 func (c *Config) Resolve(env, schema string) (*Target, error) {
 	e, envName, err := c.environment(env)
@@ -302,11 +367,38 @@ func (c *Config) Resolve(env, schema string) (*Target, error) {
 	if !hasBase && !hasOverride {
 		names, _ := c.SchemaNames(envName)
 
-		return nil, fmt.Errorf("%w: %q in environment %q (configured: %s)",
-			ErrUnknownSchema, schema, envName, strings.Join(names, ", "))
+		if !e.Discover {
+			return nil, fmt.Errorf("%w: %q in environment %q (configured: %s)",
+				ErrUnknownSchema, schema, envName, strings.Join(names, ", "))
+		}
+
+		if !plainDatabaseName.MatchString(schema) {
+			return nil, fmt.Errorf("%w: %q in environment %q is not a plain database name, so discovery will not dial it",
+				ErrUnknownSchema, schema, envName)
+		}
 	}
 
-	s := mergeSchema(base, override)
+	return c.target(e, envName, schema, mergeSchema(base, override))
+}
+
+// ServerTarget resolves an environment's server with no database selected.
+// Discovery connects here to ask which databases exist.
+func (c *Config) ServerTarget(env string) (*Target, error) {
+	e, envName, err := c.environment(env)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.target(e, envName, "", Schema{})
+}
+
+// target composes a connection from a merged schema over its environment. An
+// empty schema name means the server itself, with no default database.
+func (c *Config) target(e Environment, envName, schema string, s Schema) (*Target, error) {
+	subject := fmt.Sprintf("environment %q", envName)
+	if schema != "" {
+		subject = fmt.Sprintf("schema %q in environment %q", schema, envName)
+	}
 
 	t := &Target{
 		Profile:     c.profile,
@@ -336,12 +428,12 @@ func (c *Config) Resolve(env, schema string) (*Target, error) {
 
 	host := firstNonEmpty(s.Host, e.Host)
 	if host == "" {
-		return nil, fmt.Errorf("%w: no host for schema %q in environment %q", ErrIncomplete, schema, envName)
+		return nil, fmt.Errorf("%w: no host for %s", ErrIncomplete, subject)
 	}
 
 	user := firstNonEmpty(s.User, e.User)
 	if user == "" {
-		return nil, fmt.Errorf("%w: no user for schema %q in environment %q", ErrIncomplete, schema, envName)
+		return nil, fmt.Errorf("%w: no user for %s", ErrIncomplete, subject)
 	}
 
 	password, err := resolvePassword(s, e, envName)

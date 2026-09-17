@@ -129,6 +129,33 @@ is the last fallback. A literal `password` is used exactly as written — nothin
 is expanded, so a `$` in a generated password stays a `$`. The file is created
 0600.
 
+### Discovery
+
+When the grant already describes what is readable, listing every database in
+the file is busywork that goes stale the day someone creates a new one. Set
+`discover: true` on an environment and every database the server shows the
+user becomes a schema, by its own name:
+
+```yaml
+environments:
+  dev:
+    host: 127.0.0.1
+    user: readonly
+    password_command: "security find-generic-password -s dev-db -w"
+    discover: true
+
+schemas:
+  billing:
+    description: "invoices, payments"   # listed schemas still annotate and override
+```
+
+`schemas` and `check` then ask the server (`SHOW DATABASES`), drop its own
+system schemas, and merge the answer with what is listed. Discovery is per
+environment, never inherited by another, and it only dials plain names
+(`A-Z a-z 0-9 _ $ -`) — a schema argument cannot append driver parameters to
+the connection. Pair it with a grant that is itself read-only: discovery widens
+what can be *named*, the server still decides what can be *read*.
+
 There is deliberately **no default profile**: `--config` (or `SVIDOQ_CONFIG`)
 is required, so a command cannot quietly hit production because a stray DSN was
 lying around.

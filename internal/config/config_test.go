@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -361,4 +362,99 @@ schemas:
 func TestNoProfileIsNotAPathTraversal(t *testing.T) {
 	_, err := Dir("")
 	require.ErrorIs(t, err, ErrNoProfile)
+}
+
+const discovering = `
+default_env: dev
+environments:
+  dev:
+    host: db-dev.internal
+    user: readonly
+    password: devpw
+    discover: true
+  prod:
+    host: db-prod.internal
+    user: readonly
+    password: s3cret
+schemas:
+  billing:
+    description: "invoices"
+  analytics:
+    database: analytics_rollup
+`
+
+// The point of discover: a database created after the config was written is
+// reachable by name, with nothing to edit.
+func TestDiscoverResolvesAnUnlistedDatabase(t *testing.T) {
+	p := write(t, "acme", discovering)
+
+	cfg, err := Load(p)
+	require.NoError(t, err)
+
+	assert.True(t, cfg.Discovers("dev"))
+	assert.False(t, cfg.Discovers("prod"))
+
+	target, err := cfg.Resolve("dev", "created-tomorrow")
+	require.NoError(t, err)
+	assert.Equal(t, "readonly:devpw@tcp(db-dev.internal:3306)/created-tomorrow?parseTime=true", target.DSN)
+	assert.Empty(t, target.Description)
+
+	listed, err := cfg.Resolve("dev", "billing")
+	require.NoError(t, err)
+	assert.Equal(t, "invoices", listed.Description, "a listed schema keeps its description under discover")
+
+	_, err = cfg.Resolve("prod", "created-tomorrow")
+	require.ErrorIs(t, err, ErrUnknownSchema, "discover is per environment, not per profile")
+}
+
+// A discovered name lands in the DSN path; anything that could end the path
+// and append driver parameters must never be dialed.
+func TestDiscoverRefusesNamesThatAreNotPlainDatabaseNames(t *testing.T) {
+	p := write(t, "acme", discovering)
+
+	cfg, err := Load(p)
+	require.NoError(t, err)
+
+	for _, name := range []string{
+		"",
+		"x?allowAllFiles=true",
+		"x&multiStatements=true",
+		"a/b",
+		"a b",
+		"a)b",
+		"a.b",
+		strings.Repeat("a", 65),
+	} {
+		_, err := cfg.Resolve("dev", name)
+		require.ErrorIs(t, err, ErrUnknownSchema, "%q must be refused", name)
+	}
+}
+
+func TestWithDiscoveredMergesWithoutDuplicatesOrSystemSchemas(t *testing.T) {
+	p := write(t, "acme", discovering)
+
+	cfg, err := Load(p)
+	require.NoError(t, err)
+
+	names, err := cfg.WithDiscovered("dev", []string{
+		"billing",          // configured by name
+		"analytics_rollup", // configured through database:
+		"order-events",
+		"information_schema", "mysql", "performance_schema", "sys",
+		"we?ird",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"analytics", "billing", "order-events"}, names)
+}
+
+func TestServerTargetSelectsNoDatabase(t *testing.T) {
+	p := write(t, "acme", discovering)
+
+	cfg, err := Load(p)
+	require.NoError(t, err)
+
+	target, err := cfg.ServerTarget("dev")
+	require.NoError(t, err)
+	assert.Equal(t, "readonly:devpw@tcp(db-dev.internal:3306)/?parseTime=true", target.DSN)
+	assert.Equal(t, "readonly@tcp(db-dev.internal:3306)/?parseTime=true", target.Display)
 }

@@ -26,7 +26,7 @@ about where a result came from. `--quiet` suppresses it.
 |---|---|
 | `profiles` | list configured profiles (no profile needed) |
 | `envs` | list environments in the profile |
-| `schemas` | list schemas reachable in the environment |
+| `schemas` | list schemas reachable in the environment (with `discover`, every database the server shows) |
 | `check` | connect to every schema and report what answers |
 | `tables <schema> [--filter LIKE]` | list tables |
 | `describe <schema> <table>` | column name, type, nullability, key, default |
@@ -102,6 +102,8 @@ svidoq --config acme check
 | `statement is not read-only: ...` | layer 1 refused it; the reason names the statement kind |
 | `write blocked by the read-only transaction` | layer 1 let something through and the server caught it — report it as a bug |
 | `unknown schema ... (configured: ...)` | typo, or the schema is only defined in another environment |
+| `unknown schema ... not a plain database name` | discovery only dials `A-Z a-z 0-9 _ $ -` names |
+| `discovery failed: ...` / `(discover)  unreachable` | `SHOW DATABASES` did not answer; configured schemas are still listed |
 | `incomplete configuration: no host for ...` | the environment has no `host` and the schema does not override one |
 | `password_command failed: ...` | the secret manager refused; its stderr is included, usually "not signed in" |
 | `connection failed` | network or credentials — run `check` to see which schemas are reachable |
@@ -129,6 +131,11 @@ schemas:
   analytics:
     host: analytics-db.internal    # overrides only what differs
 ```
+
+`discover: true` on an environment makes every database the server shows the
+user a schema by its own name, so a new database needs no config edit; listed
+schemas then only add descriptions and overrides. System schemas are never
+listed, and the grant still decides what is readable.
 
 Passwords resolve in this order: the schema's, then the environment's, then
 `SVIDOQ_PASSWORD_<ENV>`. At each level: `password` (a literal, used exactly as

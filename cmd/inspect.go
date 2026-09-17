@@ -64,9 +64,13 @@ var schemasCmd = &cobra.Command{
 	Short: "List the schemas reachable in an environment",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		names, err := cfg.SchemaNames(envFlag)
+		names, discoverErr, err := schemaNames(cmd)
 		if err != nil {
 			return err
+		}
+
+		if discoverErr != nil {
+			fmt.Fprintf(stderr, "warning: %v — listing configured schemas only\n", discoverErr)
 		}
 
 		if len(names) == 0 {
@@ -104,13 +108,19 @@ Use it after editing a config, or as the first thing in triage: it separates
 "the query is wrong" from "this database is unreachable from here".`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		names, err := cfg.SchemaNames(envFlag)
+		names, discoverErr, err := schemaNames(cmd)
 		if err != nil {
 			return err
 		}
 
-		rows := make([]map[string]any, 0, len(names))
+		rows := make([]map[string]any, 0, len(names)+1)
 		failed := 0
+
+		if discoverErr != nil {
+			failed++
+
+			rows = append(rows, map[string]any{"schema": "(discover)", "status": "unreachable", "detail": firstLine(discoverErr.Error())})
+		}
 
 		for _, n := range names {
 			status, detail := probe(cmd, n)
@@ -136,6 +146,59 @@ Use it after editing a config, or as the first thing in triage: it separates
 
 		return nil
 	},
+}
+
+// discoverLimit caps SHOW DATABASES. A server with more databases than this is
+// not one a person browses by name, and a truncated list must not pass silently.
+const discoverLimit = 10000
+
+// schemaNames lists an environment's schemas: the configured ones plus, when
+// discover is on, every database the server shows. A failed discovery is
+// returned separately so the configured names stay usable.
+func schemaNames(cmd *cobra.Command) (names []string, discoverErr, err error) {
+	names, err = cfg.SchemaNames(envFlag)
+	if err != nil || !cfg.Discovers(envFlag) {
+		return names, nil, err
+	}
+
+	databases, discoverErr := discover(cmd)
+	if discoverErr != nil {
+		return names, fmt.Errorf("discovery failed: %w", discoverErr), nil
+	}
+
+	names, err = cfg.WithDiscovered(envFlag, databases)
+
+	return names, nil, err
+}
+
+// discover asks the environment's server which databases this user can see.
+func discover(cmd *cobra.Command) ([]string, error) {
+	ds, target, err := registry.OpenServer(cfg, envFlag)
+	if err != nil {
+		return nil, err
+	}
+	defer ds.Close()
+
+	res, err := ds.Query(cmd.Context(), "SHOW DATABASES",
+		datasource.QueryOpts{Limit: discoverLimit, Timeout: queryTimeout(target)})
+	if err != nil {
+		return nil, err
+	}
+
+	if res.Truncated {
+		return nil, fmt.Errorf("SHOW DATABASES returned more than %d databases", discoverLimit)
+	}
+
+	if len(res.Columns) == 0 {
+		return nil, fmt.Errorf("SHOW DATABASES returned no columns")
+	}
+
+	out := make([]string, 0, len(res.Rows))
+	for _, row := range res.Rows {
+		out = append(out, fmt.Sprint(row[res.Columns[0]]))
+	}
+
+	return out, nil
 }
 
 // probe opens one schema and asks the server who it thinks we are. It returns
