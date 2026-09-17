@@ -18,6 +18,21 @@ func Open(cfg *config.Config, env, schema string) (datasource.Datasource, *confi
 		return nil, nil, err
 	}
 
+	return dial(target)
+}
+
+// OpenServer dials an environment's server with no database selected, for
+// discovery.
+func OpenServer(cfg *config.Config, env string) (datasource.Datasource, *config.Target, error) {
+	target, err := cfg.ServerTarget(env)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return dial(target)
+}
+
+func dial(target *config.Target) (datasource.Datasource, *config.Target, error) {
 	switch target.Driver {
 	case "mysql", "mariadb":
 		ds, err := mysqldrv.Open(target.Schema, target.DSN, config.ConnectTimeout)

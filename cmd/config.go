@@ -40,6 +40,7 @@ environments:
     user: readonly
     password_env: ACME_STAGING_PASSWORD
     limit: 2000
+    # discover: true  # every database this user can see is a schema, unlisted
 
 schemas:
   billing:
@@ -108,6 +109,10 @@ var configShowCmd = &cobra.Command{
 
 		for _, env := range cfg.EnvNames() {
 			fmt.Fprintf(stdout, "[%s]\n", env)
+
+			if cfg.Discovers(env) {
+				fmt.Fprintf(stdout, "  %-20s every database the server shows (run 'schemas' to list)\n", "(discover)")
+			}
 
 			names, err := cfg.SchemaNames(env)
 			if err != nil {
