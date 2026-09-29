@@ -45,7 +45,7 @@ about where a result came from. `--quiet` suppresses it.
 | `--env <name>` | environment within the profile |
 | `--json` / `--format table\|json\|csv\|tsv` | output format; default `table` |
 | `--limit N` | row cap for this query; clamped at the environment's `max_limit` |
-| `--timeout 10s` | per-query deadline |
+| `--timeout 10s` | per-query deadline; enforced on the server (`max_statement_time` / `MAX_EXECUTION_TIME`, else `KILL QUERY`) |
 | `--quiet` | no target line, no row count on stderr |
 
 ## What is accepted
@@ -106,6 +106,10 @@ svidoq --config acme check
 | `discovery failed: ...` / `(discover)  unreachable` | `SHOW DATABASES` did not answer; configured schemas are still listed |
 | `incomplete configuration: no host for ...` | the environment has no `host` and the schema does not override one |
 | `password_command failed: ...` | the secret manager refused; its stderr is included, usually "not signed in" |
+| `query timed out after Ns: stopped by the server` | ran past `--timeout`; the server stopped it — narrow the query or add an index, do not just raise the timeout |
+| `query timed out after Ns: client deadline, KILL QUERY sent` | same, stopped by `KILL QUERY`; nothing is left running |
+| `... KILL QUERY <id> failed ...; check PROCESSLIST` | the statement may still be running on the server — look for it in `information_schema.PROCESSLIST` |
+| `warning: server ... has no statement timeout` | old server; `--timeout` falls back to `KILL QUERY` only |
 | `connection failed` | network or credentials — run `check` to see which schemas are reachable |
 
 ## Configuration

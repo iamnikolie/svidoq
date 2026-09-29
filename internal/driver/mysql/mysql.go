@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -25,6 +26,13 @@ type DB struct {
 	name      string
 	db        *sql.DB
 	multiStmt bool
+
+	// capWarned makes the "no server-side cap" warning appear once per
+	// process, not once per query.
+	capWarned sync.Once
+	// noServerCap skips the server-side cap, so an integration test can prove
+	// the KILL QUERY path on its own.
+	noServerCap bool
 }
 
 // Open dials a DSN. It does not contact the server; the first query does.
@@ -133,12 +141,12 @@ func (d *DB) runReadOnly(ctx context.Context, query string, opts datasource.Quer
 	}
 	defer conn.Close()
 
+	var connID uint64
+
 	if opts.Timeout > 0 {
-		// Server-side deadline as well as the client one: it also neutralizes
-		// SLEEP() and a plan that goes quadratic after the rows start flowing.
-		// Best effort — MariaDB spells this differently and simply ignores it.
-		_, _ = conn.ExecContext(ctx,
-			fmt.Sprintf("SET SESSION MAX_EXECUTION_TIME=%d", opts.Timeout.Milliseconds()))
+		if connID, err = d.capStatementTime(ctx, conn, opts.Timeout); err != nil {
+			return nil, err
+		}
 	}
 
 	tx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
@@ -149,13 +157,13 @@ func (d *DB) runReadOnly(ctx context.Context, query string, opts datasource.Quer
 
 	rows, err := tx.QueryContext(ctx, query)
 	if err != nil {
-		return nil, mapExecError(err)
+		return nil, d.queryError(ctx, err, connID, opts.Timeout)
 	}
 	defer rows.Close()
 
 	cols, data, truncated, err := scanRows(rows, opts.Limit)
 	if err != nil {
-		return nil, mapExecError(err)
+		return nil, d.queryError(ctx, err, connID, opts.Timeout)
 	}
 
 	return &datasource.Result{
@@ -166,6 +174,74 @@ func (d *DB) runReadOnly(ctx context.Context, query string, opts datasource.Quer
 		Truncated: truncated,
 		ElapsedMS: time.Since(start).Milliseconds(),
 	}, nil
+}
+
+// capStatementTime sets the server-side statement cap for this connection and
+// returns the connection id, which KILL QUERY needs if the client deadline
+// fires first. It runs before BeginTx: SET is issued by svidoq itself, never
+// by the user, so the validator's SET ban does not apply.
+func (d *DB) capStatementTime(ctx context.Context, conn *sql.Conn, timeout time.Duration) (uint64, error) {
+	var (
+		id      uint64
+		version string
+	)
+
+	probeStart := time.Now()
+
+	if err := conn.QueryRowContext(ctx, "SELECT CONNECTION_ID(), VERSION()").Scan(&id, &version); err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrConnectionFailed, err)
+	}
+
+	// The server starts counting when the statement starts, the client when
+	// the connection was requested. Over a slow link the connect and the two
+	// round trips still to come (SET, BEGIN) eat a real share of the budget.
+	left := timeout
+	if deadline, ok := ctx.Deadline(); ok {
+		left = time.Until(deadline) - 2*time.Since(probeStart)
+	}
+
+	if d.noServerCap || left <= 0 {
+		return id, nil
+	}
+
+	stmt := timeoutStatement(version, serverCap(left))
+
+	if _, err := conn.ExecContext(ctx, stmt); err != nil {
+		if !isUnknownVariable(err) {
+			return 0, fmt.Errorf("set statement timeout: %w", err)
+		}
+
+		// An old server without either variable. The query still runs, and
+		// KILL QUERY after the client deadline stops it — but say so.
+		d.capWarned.Do(func() {
+			warnf("server %s has no statement timeout (%v); --timeout is enforced by KILL QUERY only", version, err)
+		})
+	}
+
+	return id, nil
+}
+
+// queryError maps a failed query. When the client deadline (or a cancel) got
+// there first, the server may still be executing: stop it with KILL QUERY.
+func (d *DB) queryError(ctx context.Context, err error, connID uint64, timeout time.Duration) error {
+	if isServerTimeout(err) {
+		return timeoutError(timeout, "stopped by the server")
+	}
+
+	if ctx.Err() == nil || connID == 0 {
+		return mapExecError(err)
+	}
+
+	cause := "KILL QUERY sent"
+	if kerr := d.killQuery(connID); kerr != nil {
+		cause = fmt.Sprintf("KILL QUERY %d failed (%v); check PROCESSLIST", connID, kerr)
+	}
+
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return timeoutError(timeout, "client deadline, "+cause)
+	}
+
+	return fmt.Errorf("%w (%s)", ctx.Err(), cause)
 }
 
 // mapExecError translates MySQL 1792 into ErrWriteBlocked so the CLI can say

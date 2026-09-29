@@ -63,6 +63,23 @@ SELECT * FROM t FOR UPDATE               → changes nothing, stalls every write
 rejects it with error 1792. The two layers share no code, and the integration
 suite verifies layer 2 by deliberately bypassing layer 1.
 
+## The timeout is enforced on the server
+
+A client-side deadline alone does not stop a query: the driver hangs up, and
+the server keeps executing a statement that has not produced output yet — an
+aggregate can run on for hours. So `--timeout` is applied twice:
+
+- **A server-side cap, set per session**, sized to land just before the
+  deadline (connect and setup round trips are subtracted):
+  `max_statement_time` on MariaDB, `MAX_EXECUTION_TIME` on MySQL (which caps
+  `SELECT` only). The server stops the statement and svidoq reports
+  `query timed out after 5s: stopped by the server`.
+- **`KILL QUERY` if the client deadline fires first** — a non-`SELECT` on MySQL,
+  or a server that has neither variable (svidoq warns about that on stderr).
+  It goes over a second short connection; any account may kill its own
+  threads. The error then reads `... client deadline, KILL QUERY sent`, or says
+  the kill failed and to check `PROCESSLIST`.
+
 ## Install
 
 **Homebrew:**
@@ -203,7 +220,7 @@ Run `svidoq skill` for the full agent reference.
 | `--format table\|json\|csv\|tsv` | Output format (default `table`) |
 | `--json` | Alias for `--format json` |
 | `--limit N` | Row cap for this query, clamped at the environment's `max_limit` |
-| `--timeout 10s` | Per-query deadline |
+| `--timeout 10s` | Per-query deadline, enforced on the server (see above) |
 | `--quiet` | Suppress the target line and row count on stderr |
 
 ## Supported databases
@@ -216,7 +233,7 @@ actually tested is claimed here.
 
 ```bash
 make test          # go test ./... — hermetic, no network, no database
-make integration   # spins up MySQL in Docker and runs the live suite
+make integration   # spins up MySQL 8.4 and MariaDB 10.6 in Docker, runs the live suite on each
 make vet
 make fmt
 make build
@@ -225,7 +242,9 @@ make build
 The unit suite never touches a database. The integration suite is skipped
 unless `SVIDOQ_TEST_DSN` is set, and it is the one that proves the second
 layer: it runs writes through the transaction *deliberately bypassing the
-validator* and asserts the server refuses them.
+validator* and asserts the server refuses them. It also checks that a timed-out
+statement is gone from `PROCESSLIST`, both via the server cap and via
+`KILL QUERY` alone.
 
 ## Contributing
 

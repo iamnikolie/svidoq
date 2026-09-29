@@ -3,7 +3,9 @@ package mysql
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,19 +69,96 @@ func TestIntegrationEngineBlocksWritesThatSkipTheValidator(t *testing.T) {
 	}
 }
 
+// stillRunning reports whether a statement carrying marker is still executing
+// on the server, polling for up to two seconds for it to go away.
+func stillRunning(t *testing.T, db *DB, marker string) bool {
+	t.Helper()
+
+	q := "SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST" +
+		" WHERE ID <> CONNECTION_ID() AND INFO LIKE " + quoteLiteral("%"+marker+"%")
+
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
+		res, err := db.Query(context.Background(), q, datasource.QueryOpts{Limit: 1, Timeout: 5 * time.Second})
+		if err != nil {
+			t.Fatalf("processlist: %v", err)
+		}
+
+		if fmt.Sprint(res.Rows[0]["n"]) == "0" {
+			return false
+		}
+	}
+
+	return true
+}
+
+// SLEEP is only part of the statement: MySQL returns no error when a
+// statement that is nothing but SLEEP() gets interrupted.
 func TestIntegrationTimeoutStopsARunawayQuery(t *testing.T) {
 	db := testDB(t)
 
 	start := time.Now()
 
-	_, err := db.Query(context.Background(), "SELECT SLEEP(10)",
+	_, err := db.Query(context.Background(), "SELECT SLEEP(5) AS svidoq_server_cap FROM invoices",
 		datasource.QueryOpts{Limit: 1, Timeout: time.Second})
-	if err == nil {
-		t.Fatal("a 10s sleep under a 1s timeout should fail")
+	if !errors.Is(err, ErrQueryTimeout) {
+		t.Fatalf("a 5s sleep under a 1s timeout = %v, want ErrQueryTimeout", err)
 	}
 
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
+	if !strings.Contains(err.Error(), "stopped by the server") {
+		t.Errorf("the server cap should win the race with the client deadline: %v", err)
+	}
+
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("timeout did not fire promptly: %s", elapsed)
+	}
+
+	if stillRunning(t, db, "svidoq_server_cap") {
+		t.Fatal("the statement is still running on the server after the timeout")
+	}
+}
+
+// Without a server-side cap (an old server, or MySQL on a non-SELECT) the
+// client deadline only closes the socket; KILL QUERY must stop the statement.
+func TestIntegrationClientDeadlineKillsTheQuery(t *testing.T) {
+	db := testDB(t)
+	db.noServerCap = true
+
+	_, err := db.Query(context.Background(), "SELECT SLEEP(5) AS svidoq_kill_probe",
+		datasource.QueryOpts{Limit: 1, Timeout: time.Second})
+	if !errors.Is(err, ErrQueryTimeout) {
+		t.Fatalf("got %v, want ErrQueryTimeout", err)
+	}
+
+	if !strings.Contains(err.Error(), "KILL QUERY sent") {
+		t.Errorf("error should say the query was killed: %v", err)
+	}
+
+	if stillRunning(t, db, "svidoq_kill_probe") {
+		t.Fatal("the statement outlived the client deadline: KILL QUERY did not stop it")
+	}
+}
+
+func TestIntegrationSessionCarriesTheStatementCap(t *testing.T) {
+	db := testDB(t)
+
+	res, err := db.Query(context.Background(), "SELECT VERSION() AS v",
+		datasource.QueryOpts{Limit: 1, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("version: %v", err)
+	}
+
+	q := "SELECT @@max_execution_time AS cap"
+	if isMariaDB(fmt.Sprint(res.Rows[0]["v"])) {
+		q = "SELECT @@max_statement_time AS cap"
+	}
+
+	res, err = db.Query(context.Background(), q, datasource.QueryOpts{Limit: 1, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("%s: %v", q, err)
+	}
+
+	if got := fmt.Sprint(res.Rows[0]["cap"]); got == "0" || got == "0.000000" {
+		t.Fatalf("%s = %s inside a session with --timeout, want non-zero", q, got)
 	}
 }
 
