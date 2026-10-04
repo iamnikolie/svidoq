@@ -5,6 +5,11 @@ updates:
     schedule:
       interval: monthly
     open-pull-requests-limit: 5
+    # The TiDB parser has no usable tags of its own (it lives in the TiDB
+    # monorepo), so Dependabot cannot resolve it and fails the whole run.
+    # Bump it by hand: go get github.com/pingcap/tidb/pkg/parser@master
+    ignore:
+      - dependency-name: github.com/pingcap/tidb/pkg/parser
 
   - package-ecosystem: github-actions
     directory: /
