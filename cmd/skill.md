@@ -114,6 +114,7 @@ svidoq --config acme check
 | `ssh tunnel: ... host key for ... is not in ...` | the SSH host is not in known_hosts; svidoq never adds a key — verify the printed fingerprint, then add it |
 | `ssh tunnel: ... HOST KEY MISMATCH ...` | known_hosts holds a different key for the SSH host — stop and find out why |
 | `ssh tunnel: handshake ... unable to authenticate` | the SSH key was refused, or `key` points at the wrong file |
+| `ssh tunnel: key ... is accessible by others` | the key file's mode lets others read it; `chmod 600` it — svidoq will not use it as is |
 | `ssh tunnel: open <addr> via ... refused the forward` | the SSH account may not open that address (sshd `PermitOpen`); check the environment's `host`/`port` |
 
 ## Configuration
@@ -170,8 +171,10 @@ environments:
       # known_hosts: ~/.ssh/known_hosts
 ```
 
-The host key must already be in `known_hosts`: an unknown key is refused like a
-changed one, and nothing is ever written there. Only TCP forwards are opened —
+The host key must already be in `known_hosts` (a plain key, or an
+`@cert-authority` line for a host certificate): an unknown key is refused like
+a changed one, and nothing is ever written there. The key file must be private
+(mode 600 or 400), as ssh requires. Only TCP forwards are opened —
 no shell, no command, no agent forwarding. A passphrase-protected key needs
 ssh-agent or `SVIDOQ_SSH_PASSPHRASE`. The target line ends with
 `via ssh tunnel@bastion.internal:22`. `readTimeout`/`writeTimeout` DSN params

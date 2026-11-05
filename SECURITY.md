@@ -37,7 +37,8 @@ Known and by design rather than vulnerabilities:
   as trusted as the file, which is as trusted as your account.
 - **An `ssh:` block trusts `known_hosts`.** The host key check is strict and
   svidoq never adds a key, so the file is the trust anchor: whoever can write
-  it can redirect the tunnel. The SSH key it names is as sensitive as any key
+  it can redirect the tunnel. An `@cert-authority` line extends that trust to
+  every host certificate the CA signs for the matching names. The SSH key it names is as sensitive as any key
   in `~/.ssh`; give it to an account that can only forward.
 - **Query results are printed as they arrive.** Content is not sanitized for
   the terminal, and database content is written by other people.

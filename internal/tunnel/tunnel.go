@@ -22,9 +22,11 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +51,16 @@ type Tunnel struct {
 	cfg     config.SSH
 	timeout time.Duration
 
+	// life is cancelled by Close, which aborts a connect in progress — its
+	// sockets, the agent's included, are closed under it.
+	life     context.Context
+	shutdown context.CancelFunc
+
+	// connecting admits one connect attempt at a time. It is a channel, not a
+	// mutex, so a waiter still honours its own context and Close.
+	connecting chan struct{}
+
+	// mu guards the fields below and is never held across network IO.
 	mu     sync.Mutex
 	client *ssh.Client
 	closed bool
@@ -66,7 +78,9 @@ func New(cfg config.SSH, timeout time.Duration) *Tunnel {
 		cfg.KnownHosts = config.DefaultKnownHosts
 	}
 
-	return &Tunnel{cfg: cfg, timeout: timeout}
+	life, shutdown := context.WithCancel(context.Background())
+
+	return &Tunnel{cfg: cfg, timeout: timeout, life: life, shutdown: shutdown, connecting: make(chan struct{}, 1)}
 }
 
 // String names the hop: user@host:port.
@@ -101,17 +115,19 @@ func (t *Tunnel) DialContext(ctx context.Context, network, addr string) (net.Con
 // Close tears down the SSH connection and every forward on it. A closed
 // tunnel cannot be dialed again.
 func (t *Tunnel) Close() error {
+	t.shutdown()
+
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	t.closed = true
+	client := t.client
+	t.client = nil
+	t.mu.Unlock()
 
-	if t.client == nil {
+	if client == nil {
 		return nil
 	}
 
-	err := t.client.Close()
-	t.client = nil
+	err := client.Close()
 
 	if errors.Is(err, net.ErrClosed) {
 		return nil
@@ -123,25 +139,69 @@ func (t *Tunnel) Close() error {
 // connect returns the SSH client, opening it on first use. A failed attempt
 // is not remembered, so a pool retry gets a fresh one.
 func (t *Tunnel) connect(ctx context.Context) (*ssh.Client, error) {
+	if client, err := t.current(); client != nil || err != nil {
+		return client, err
+	}
+
+	select {
+	case t.connecting <- struct{}{}:
+		defer func() { <-t.connecting }()
+	case <-ctx.Done():
+		return nil, fmt.Errorf("%w: waiting to connect to %s: %w", ErrTunnel, t, ctx.Err())
+	case <-t.life.Done():
+		return nil, t.closedError()
+	}
+
+	// Another caller may have connected while this one waited.
+	if client, err := t.current(); client != nil || err != nil {
+		return client, err
+	}
+
+	// The attempt ends at the caller's deadline or at Close, whichever is first.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	stop := context.AfterFunc(t.life, cancel)
+	defer stop()
+
+	client, err := t.dial(ctx)
+	if err != nil {
+		if t.life.Err() != nil {
+			return nil, t.closedError()
+		}
+
+		return nil, err
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if t.closed {
-		return nil, fmt.Errorf("%w: %s is closed", ErrTunnel, t)
-	}
+		_ = client.Close()
 
-	if t.client != nil {
-		return t.client, nil
-	}
-
-	client, err := t.dial(ctx)
-	if err != nil {
-		return nil, err
+		return nil, t.closedError()
 	}
 
 	t.client = client
 
 	return client, nil
+}
+
+// current returns the open client, an error when the tunnel is closed, or
+// neither when a connect is needed.
+func (t *Tunnel) current() (*ssh.Client, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.closed {
+		return nil, t.closedError()
+	}
+
+	return t.client, nil
+}
+
+func (t *Tunnel) closedError() error {
+	return fmt.Errorf("%w: %s is closed", ErrTunnel, t)
 }
 
 func (t *Tunnel) dial(ctx context.Context) (*ssh.Client, error) {
@@ -157,7 +217,7 @@ func (t *Tunnel) dial(ctx context.Context) (*ssh.Client, error) {
 		return nil, err
 	}
 
-	auth, closeAgent, err := authMethods(t.cfg)
+	auth, closeAgent, err := authMethods(ctx, t.cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -246,6 +306,11 @@ func hostKeyCallback(path, host string) (ssh.HostKeyCallback, ssh.HostKeyCallbac
 // RSA — and then fails against a file that only has the host's ed25519 key,
 // although that key would have verified fine. Nil means the library default.
 // cb must be the bare knownhosts callback: the probe reads its KeyError.
+//
+// An @cert-authority line says nothing about the host key's own type — its
+// key is the CA's — so it contributes the certificate algorithms instead, and
+// the strict callback then checks the certificate against that CA. Plain host
+// keys come first, so a host known both ways is verified by its own key.
 func hostKeyAlgorithms(cb ssh.HostKeyCallback, hostport string, remote net.Addr) []string {
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -262,16 +327,13 @@ func hostKeyAlgorithms(cb ssh.HostKeyCallback, hostport string, remote net.Addr)
 		return nil
 	}
 
-	var algos []string
+	var (
+		algos []string
+		ca    bool
+	)
 
 	seen := map[string]bool{}
-
-	for _, k := range ke.Want {
-		types := []string{k.Key.Type()}
-		if k.Key.Type() == ssh.KeyAlgoRSA {
-			types = []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256}
-		}
-
+	add := func(types ...string) {
 		for _, a := range types {
 			if !seen[a] {
 				seen[a] = true
@@ -281,13 +343,69 @@ func hostKeyAlgorithms(cb ssh.HostKeyCallback, hostport string, remote net.Addr)
 		}
 	}
 
+	lines := knownHostsLines{}
+
+	for _, k := range ke.Want {
+		switch {
+		case lines.isCertAuthority(k.Filename, k.Line):
+			ca = true
+		case k.Key.Type() == ssh.KeyAlgoRSA:
+			add(ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256)
+		default:
+			add(k.Key.Type())
+		}
+	}
+
+	if ca {
+		add(certAlgorithms...)
+	}
+
 	return algos
+}
+
+// certAlgorithms are the host certificate types offered when known_hosts
+// trusts a CA for the host. SHA-1 RSA and DSA are left out, as for plain keys.
+var certAlgorithms = []string{
+	ssh.CertAlgoED25519v01,
+	ssh.CertAlgoECDSA256v01, ssh.CertAlgoECDSA384v01, ssh.CertAlgoECDSA521v01,
+	ssh.CertAlgoRSASHA512v01, ssh.CertAlgoRSASHA256v01,
+	ssh.CertAlgoSKED25519v01, ssh.CertAlgoSKECDSA256v01,
+}
+
+// knownHostsLines tells which known_hosts lines are @cert-authority entries.
+// knownhosts reports matching CA lines among the host's keys, with only their
+// file and line number to tell them apart.
+type knownHostsLines map[string][]string
+
+func (l knownHostsLines) isCertAuthority(file string, line int) bool {
+	text, ok := l[file]
+	if !ok {
+		raw, err := os.ReadFile(file)
+		if err == nil {
+			text = strings.Split(string(raw), "\n")
+		}
+
+		l[file] = text
+	}
+
+	if line < 1 || line > len(text) {
+		return false
+	}
+
+	fields := strings.Fields(text[line-1])
+
+	return len(fields) > 0 && fields[0] == "@cert-authority"
 }
 
 // authMethods mirrors plain ssh: the configured key first (decrypted with
 // $SVIDOQ_SSH_PASSPHRASE when it is protected), then the keys ssh-agent holds.
 // A protected key with no passphrase is skipped when the agent can sign for it.
-func authMethods(c config.SSH) ([]ssh.AuthMethod, func(), error) {
+//
+// The agent is a second socket the handshake waits on: an agent that never
+// answers — or waits for a confirmation nobody gives — must not outlast ctx.
+// Its connection carries ctx's deadline and is closed when ctx ends, which
+// fails a pending list or sign call instead of leaving it blocked.
+func authMethods(ctx context.Context, c config.SSH) ([]ssh.AuthMethod, func(), error) {
 	var (
 		methods      []ssh.AuthMethod
 		agentSigners func() ([]ssh.Signer, error)
@@ -296,9 +414,19 @@ func authMethods(c config.SSH) ([]ssh.AuthMethod, func(), error) {
 	closeAgent := func() {}
 
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
-		if conn, err := net.Dial("unix", sock); err == nil {
+		var d net.Dialer
+
+		if conn, err := d.DialContext(ctx, "unix", sock); err == nil {
+			if deadline, ok := ctx.Deadline(); ok {
+				_ = conn.SetDeadline(deadline)
+			}
+
+			stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 			agentSigners = agent.NewClient(conn).Signers
-			closeAgent = func() { _ = conn.Close() }
+			closeAgent = func() {
+				stop()
+				_ = conn.Close()
+			}
 		}
 	}
 
@@ -311,9 +439,9 @@ func authMethods(c config.SSH) ([]ssh.AuthMethod, func(), error) {
 	if c.Key != "" {
 		path := expandHome(c.Key)
 
-		raw, err := os.ReadFile(path)
+		raw, err := readPrivateKey(path)
 		if err != nil {
-			return fail(fmt.Errorf("read key: %w", err))
+			return fail(err)
 		}
 
 		signer, err := ssh.ParsePrivateKey(raw)
@@ -352,6 +480,44 @@ func authMethods(c config.SSH) ([]ssh.AuthMethod, func(), error) {
 
 	return methods, closeAgent, nil
 }
+
+// readPrivateKey reads a key file the way ssh would agree to use it: a regular
+// file that no one but its owner can read or write. A key others can read is
+// a key others may already have; ssh ignores such a file, and so does svidoq —
+// it says so rather than fixing the mode itself. Windows has no such mode
+// bits; its ACLs are left to the operating system.
+func readPrivateKey(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read key: %w", err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("read key: %w", err)
+	}
+
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("key %s is not a regular file", path)
+	}
+
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("key %s is accessible by others (mode %04o); refusing to use it, as ssh does — run chmod 600 %s",
+			path, info.Mode().Perm(), path)
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(f, maxKeyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("read key: %w", err)
+	}
+
+	return raw, nil
+}
+
+// maxKeyBytes is far above any real private key; a path pointing at something
+// else is not read whole.
+const maxKeyBytes = 1 << 20
 
 func expandHome(p string) string {
 	if p == "~" || strings.HasPrefix(p, "~/") {

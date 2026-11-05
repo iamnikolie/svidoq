@@ -201,13 +201,19 @@ deliberately narrow:
 
 - **Strict host keys.** The SSH host's key must already be in `known_hosts`.
   An unknown key is refused exactly like a changed one, the fingerprint is
-  printed so you can check it, and svidoq never writes to the file.
+  printed so you can check it, and svidoq never writes to the file. An
+  `@cert-authority` line works too: the host's certificate is checked against
+  that CA.
 - **Forwards only.** svidoq opens TCP forwards and nothing else — no shell, no
   command, no agent forwarding. An account limited to forwarding (sshd
   `PermitOpen 127.0.0.1:3306`, `ForceCommand /usr/sbin/nologin`) is all it
   needs, and is what to give it.
-- **Bounded.** Connect, handshake and every forward share the connect timeout,
-  and a silent server cannot hold the handshake open.
+- **Bounded.** Connect, handshake, ssh-agent calls and every forward share the
+  connect timeout; a silent server or a stuck agent cannot hold a command past
+  it, and the end of the command aborts a connect still in progress.
+- **Private keys stay private.** Like ssh, svidoq refuses a key file that its
+  group or others can read or write, and says to `chmod 600` it rather than
+  changing it.
 
 A passphrase-protected key needs ssh-agent or `SVIDOQ_SSH_PASSPHRASE`. The
 agent, when present, signs the login; it is never forwarded. The read-only
