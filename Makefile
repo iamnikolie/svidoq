@@ -38,6 +38,7 @@ integration-engine:
 		"CREATE TABLE IF NOT EXISTS invoices (id INT PRIMARY KEY AUTO_INCREMENT, client VARCHAR(64), total DECIMAL(10,2)); \
 		 INSERT INTO invoices (client,total) VALUES ('a',1),('b',2);" 2>/dev/null || true
 	SVIDOQ_TEST_DSN='root:testpw@tcp(127.0.0.1:13399)/billing?parseTime=true' go test ./... -count=1 -run Integration -v
+	SVIDOQ_TEST_VIA_SSH=1 SVIDOQ_TEST_DSN='root:testpw@tcp(127.0.0.1:13399)/billing?parseTime=true' go test ./... -count=1 -run Integration -v
 	docker rm -f svidoq-test >/dev/null
 
 vet:

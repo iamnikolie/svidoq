@@ -111,6 +111,10 @@ svidoq --config acme check
 | `... KILL QUERY <id> failed ...; check PROCESSLIST` | the statement may still be running on the server — look for it in `information_schema.PROCESSLIST` |
 | `warning: server ... has no statement timeout` | old server; `--timeout` falls back to `KILL QUERY` only |
 | `connection failed` | network or credentials — run `check` to see which schemas are reachable |
+| `ssh tunnel: ... host key for ... is not in ...` | the SSH host is not in known_hosts; svidoq never adds a key — verify the printed fingerprint, then add it |
+| `ssh tunnel: ... HOST KEY MISMATCH ...` | known_hosts holds a different key for the SSH host — stop and find out why |
+| `ssh tunnel: handshake ... unable to authenticate` | the SSH key was refused, or `key` points at the wrong file |
+| `ssh tunnel: open <addr> via ... refused the forward` | the SSH account may not open that address (sshd `PermitOpen`); check the environment's `host`/`port` |
 
 ## Configuration
 
@@ -146,3 +150,29 @@ Passwords resolve in this order: the schema's, then the environment's, then
 written), `password_env` (the name of an environment variable), or
 `password_command` (its stdout). Nothing is expanded, so a `$` in a password is
 a `$`. A schema may set `url:` for a full DSN, bypassing composition entirely.
+
+An `ssh:` block on an environment makes svidoq forward its connections through
+an SSH host itself, for the length of one command — no tunnel to open first.
+The environment's `host`/`port` (and a `url:` DSN's address) are then the
+database as seen *from the SSH host*, usually `127.0.0.1:3306`:
+
+```yaml
+environments:
+  dev:
+    host: 127.0.0.1           # as seen from the SSH host
+    user: readonly
+    password_env: DEV_DB_PASSWORD
+    ssh:
+      host: bastion.internal
+      user: tunnel
+      key: ~/.ssh/id_ed25519  # optional when ssh-agent holds the key
+      # port: 22
+      # known_hosts: ~/.ssh/known_hosts
+```
+
+The host key must already be in `known_hosts`: an unknown key is refused like a
+changed one, and nothing is ever written there. Only TCP forwards are opened —
+no shell, no command, no agent forwarding. A passphrase-protected key needs
+ssh-agent or `SVIDOQ_SSH_PASSPHRASE`. The target line ends with
+`via ssh tunnel@bastion.internal:22`. `readTimeout`/`writeTimeout` DSN params
+are refused over SSH; `--timeout` works unchanged.

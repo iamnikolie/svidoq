@@ -458,3 +458,88 @@ func TestServerTargetSelectsNoDatabase(t *testing.T) {
 	assert.Equal(t, "readonly:devpw@tcp(db-dev.internal:3306)/?parseTime=true", target.DSN)
 	assert.Equal(t, "readonly@tcp(db-dev.internal:3306)/?parseTime=true", target.Display)
 }
+
+const withSSH = `
+default_env: dev
+environments:
+  dev:
+    host: 127.0.0.1
+    user: readonly
+    password: pw
+    ssh:
+      host: bastion.internal
+      user: tunnel
+      key: ~/.ssh/id_ed25519
+  other:
+    host: db.internal
+    user: readonly
+    ssh:
+      host: bastion.internal
+      port: 2222
+      user: tunnel
+      known_hosts: /etc/ssh/ssh_known_hosts
+schemas:
+  billing: {}
+  raw:
+    url: "readonly:pw@tcp(127.0.0.1:3306)/raw"
+`
+
+func TestSSHBlockAppliesDefaultsAndKeepsTheDatabaseAddressRemote(t *testing.T) {
+	cfg, err := Load(write(t, "acme", withSSH))
+	require.NoError(t, err)
+
+	target, err := cfg.Resolve("", "billing")
+	require.NoError(t, err)
+
+	require.NotNil(t, target.SSH)
+	assert.Equal(t, SSH{Host: "bastion.internal", Port: 22, User: "tunnel", Key: "~/.ssh/id_ed25519", KnownHosts: "~/.ssh/known_hosts"}, *target.SSH)
+	assert.Equal(t, "readonly:pw@tcp(127.0.0.1:3306)/billing?parseTime=true", target.DSN,
+		"host and port are the database as seen from the ssh host")
+	assert.Equal(t, "readonly@tcp(127.0.0.1:3306)/billing?parseTime=true via ssh tunnel@bastion.internal:22", target.Display)
+
+	other, err := cfg.Resolve("other", "billing")
+	require.NoError(t, err)
+	assert.Equal(t, 2222, other.SSH.Port)
+	assert.Equal(t, "/etc/ssh/ssh_known_hosts", other.SSH.KnownHosts)
+}
+
+func TestSSHBlockCarriesURLSchemasAndServerTargets(t *testing.T) {
+	cfg, err := Load(write(t, "acme", withSSH))
+	require.NoError(t, err)
+
+	raw, err := cfg.Resolve("", "raw")
+	require.NoError(t, err)
+	require.NotNil(t, raw.SSH, "a url: schema is reached through the same hop")
+	assert.Equal(t, "readonly:***@tcp(127.0.0.1:3306)/raw via ssh tunnel@bastion.internal:22", raw.Display)
+
+	server, err := cfg.ServerTarget("")
+	require.NoError(t, err)
+	require.NotNil(t, server.SSH, "discovery goes through the hop too")
+}
+
+func TestNoSSHBlockMeansADirectConnection(t *testing.T) {
+	cfg, err := Load(write(t, "acme", sample))
+	require.NoError(t, err)
+
+	target, err := cfg.Resolve("", "billing")
+	require.NoError(t, err)
+	assert.Nil(t, target.SSH)
+	assert.NotContains(t, target.Display, "via ssh")
+}
+
+func TestIncompleteSSHBlockIsRejectedBeforeDialing(t *testing.T) {
+	for name, block := range map[string]string{
+		"no host":  "ssh: {user: tunnel}",
+		"no user":  "ssh: {host: bastion.internal}",
+		"bad port": "ssh: {host: bastion.internal, user: tunnel, port: 70000}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := Load(write(t, "acme", "environments:\n  dev:\n    host: 127.0.0.1\n    user: u\n    "+block+"\nschemas:\n  billing: {}\n"))
+			require.NoError(t, err)
+
+			_, err = cfg.Resolve("dev", "billing")
+			require.ErrorIs(t, err, ErrIncomplete)
+			assert.Contains(t, err.Error(), "ssh")
+		})
+	}
+}

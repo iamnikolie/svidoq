@@ -9,7 +9,10 @@ import (
 	"testing"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/iamnikolie/svidoq/internal/datasource"
+	"github.com/iamnikolie/svidoq/internal/tunnel"
+	"github.com/iamnikolie/svidoq/internal/tunnel/sshtest"
 )
 
 // These tests need a real server. They are skipped unless SVIDOQ_TEST_DSN is
@@ -18,6 +21,10 @@ import (
 //	docker run -d --name svidoq-test -e MYSQL_ROOT_PASSWORD=testpw \
 //	  -e MYSQL_DATABASE=billing -p 13399:3306 mysql:8.4
 //	SVIDOQ_TEST_DSN='root:testpw@tcp(127.0.0.1:13399)/billing?parseTime=true' go test ./...
+//
+// With SVIDOQ_TEST_VIA_SSH=1 every connection — the queries, the PROCESSLIST
+// probes and KILL QUERY — goes through an in-process SSH server that permits
+// only the DSN's address, the way a forward-only account would.
 func testDB(t *testing.T) *DB {
 	t.Helper()
 
@@ -26,7 +33,26 @@ func testDB(t *testing.T) *DB {
 		t.Skip("set SVIDOQ_TEST_DSN to run integration tests")
 	}
 
-	db, err := Open("billing", dsn, 5*time.Second)
+	var via Transport
+
+	if os.Getenv("SVIDOQ_TEST_VIA_SSH") != "" {
+		cfg, err := mysqldriver.ParseDSN(dsn)
+		if err != nil {
+			t.Fatalf("parse dsn: %v", err)
+		}
+
+		f := sshtest.New(t, cfg.Addr)
+		via = tunnel.New(f.Config, 5*time.Second)
+
+		// Cleanups run last-in first-out: this one runs after db.Close.
+		t.Cleanup(func() {
+			if n := len(f.Server.Stats().Channels); n == 0 {
+				t.Error("SVIDOQ_TEST_VIA_SSH is set but no connection went through the tunnel")
+			}
+		})
+	}
+
+	db, err := Open("billing", dsn, 5*time.Second, via)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

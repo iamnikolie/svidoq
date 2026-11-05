@@ -40,7 +40,7 @@ func TestQuoteLiteral(t *testing.T) {
 // call is exactly the shape the validator exists to refuse, and defence in
 // depth means the transport cannot carry it either.
 func TestOpenDisablesMultiStatements(t *testing.T) {
-	db, err := Open("x", "u:p@tcp(127.0.0.1:1)/d?parseTime=true&multiStatements=true", 0)
+	db, err := Open("x", "u:p@tcp(127.0.0.1:1)/d?parseTime=true&multiStatements=true", 0, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

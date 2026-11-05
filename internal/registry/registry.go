@@ -9,6 +9,7 @@ import (
 	"github.com/iamnikolie/svidoq/internal/config"
 	"github.com/iamnikolie/svidoq/internal/datasource"
 	mysqldrv "github.com/iamnikolie/svidoq/internal/driver/mysql"
+	"github.com/iamnikolie/svidoq/internal/tunnel"
 )
 
 // Open resolves a schema in an environment and dials it.
@@ -35,7 +36,13 @@ func OpenServer(cfg *config.Config, env string) (datasource.Datasource, *config.
 func dial(target *config.Target) (datasource.Datasource, *config.Target, error) {
 	switch target.Driver {
 	case "mysql", "mariadb":
-		ds, err := mysqldrv.Open(target.Schema, target.DSN, config.ConnectTimeout)
+		// A nil *tunnel.Tunnel must not become a non-nil interface.
+		var via mysqldrv.Transport
+		if target.SSH != nil {
+			via = tunnel.New(*target.SSH, config.ConnectTimeout)
+		}
+
+		ds, err := mysqldrv.Open(target.Schema, target.DSN, config.ConnectTimeout, via)
 		if err != nil {
 			return nil, nil, err
 		}

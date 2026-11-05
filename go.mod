@@ -1,12 +1,13 @@
 module github.com/iamnikolie/svidoq
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/pingcap/tidb/pkg/parser v0.0.0-20260910125911-470dbf70499c
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
+	golang.org/x/crypto v0.58.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -22,6 +23,7 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/text v0.39.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 )

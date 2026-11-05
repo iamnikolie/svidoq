@@ -35,7 +35,8 @@ make test
 
 CI runs the same three (plus `-race`) on Linux and macOS. If you touched the
 driver, run `make integration` too — it spins up MySQL in Docker, seeds it, and
-runs the live suite including the deliberate layer-2 bypass.
+runs the live suite including the deliberate layer-2 bypass, once directly and
+once through an in-process SSH server.
 
 House rules:
 

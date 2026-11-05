@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -33,10 +34,31 @@ type DB struct {
 	// noServerCap skips the server-side cap, so an integration test can prove
 	// the KILL QUERY path on its own.
 	noServerCap bool
+
+	// via carries every connection when set, and is closed with the pool.
+	via Transport
 }
 
-// Open dials a DSN. It does not contact the server; the first query does.
-func Open(name, dsn string, connectTimeout time.Duration) (*DB, error) {
+// Transport carries connections to the server another way than a direct
+// dial — an SSH tunnel. It only moves bytes: every statement still passes the
+// validator and the read-only transaction, whichever way it travels.
+type Transport interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+	Close() error
+}
+
+// Open dials a DSN, directly or through via when it is not nil. It does not
+// contact the server; the first query does. The DB owns via from here on: it
+// is closed with the DB, or before Open returns an error.
+func Open(name, dsn string, connectTimeout time.Duration, via Transport) (db *DB, err error) {
+	if via != nil {
+		defer func() {
+			if err != nil {
+				_ = via.Close()
+			}
+		}()
+	}
+
 	cfg, err := mysqldriver.ParseDSN(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse dsn: %w", err)
@@ -44,6 +66,14 @@ func Open(name, dsn string, connectTimeout time.Duration) (*DB, error) {
 
 	if connectTimeout > 0 {
 		cfg.Timeout = connectTimeout
+	}
+
+	if via != nil {
+		if err := checkTransportable(cfg); err != nil {
+			return nil, err
+		}
+
+		cfg.DialFunc = via.DialContext
 	}
 
 	// Refuse multi-statement mode whatever the DSN asked for. The validator
@@ -63,11 +93,29 @@ func Open(name, dsn string, connectTimeout time.Duration) (*DB, error) {
 
 	// A read-only CLI never needs concurrency; a small pool keeps the
 	// connection count on a shared production server unremarkable.
-	db := sql.OpenDB(connector)
-	db.SetMaxOpenConns(2)
-	db.SetMaxIdleConns(1)
+	pool := sql.OpenDB(connector)
+	pool.SetMaxOpenConns(2)
+	pool.SetMaxIdleConns(1)
 
-	return &DB{name: name, db: db, multiStmt: cfg.MultiStatements}, nil
+	return &DB{name: name, db: pool, multiStmt: cfg.MultiStatements, via: via}, nil
+}
+
+// checkTransportable refuses what a forwarded connection cannot honour. An SSH
+// channel has no read or write deadlines, so a readTimeout or writeTimeout in
+// the DSN would fail every query; --timeout does not depend on them.
+func checkTransportable(cfg *mysqldriver.Config) error {
+	switch cfg.Net {
+	case "tcp", "tcp4", "tcp6":
+	default:
+		return fmt.Errorf("an ssh tunnel forwards tcp only; the DSN asks for %s(%s)", cfg.Net, cfg.Addr)
+	}
+
+	if cfg.ReadTimeout > 0 || cfg.WriteTimeout > 0 {
+		return errors.New("readTimeout and writeTimeout are not supported over an ssh tunnel " +
+			"(an ssh channel has no deadlines); drop them — --timeout still applies")
+	}
+
+	return nil
 }
 
 // multiStatements reports the setting the pool was actually opened with, so a
@@ -80,8 +128,16 @@ func (d *DB) Name() string { return d.name }
 // Driver returns the driver identifier.
 func (d *DB) Driver() string { return "mysql" }
 
-// Close releases the pool.
-func (d *DB) Close() error { return d.db.Close() }
+// Close releases the pool, then the transport under it.
+func (d *DB) Close() error {
+	err := d.db.Close()
+
+	if d.via != nil {
+		err = errors.Join(err, d.via.Close())
+	}
+
+	return err
+}
 
 // Query validates that sql is read-only, then runs it.
 func (d *DB) Query(ctx context.Context, query string, opts datasource.QueryOpts) (*datasource.Result, error) {

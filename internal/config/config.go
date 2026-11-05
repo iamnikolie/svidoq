@@ -15,11 +15,13 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +38,11 @@ const (
 	ConnectTimeout  = 10 * time.Second
 	DefaultPort     = 3306
 	DefaultDriver   = "mysql"
+	DefaultSSHPort  = 22
+
+	// DefaultKnownHosts is where an ssh block's host key is looked up when it
+	// names no known_hosts file of its own.
+	DefaultKnownHosts = "~/.ssh/known_hosts"
 )
 
 var (
@@ -91,8 +98,35 @@ type Environment struct {
 	// schemas still contribute descriptions and overrides.
 	Discover bool `yaml:"discover"`
 
+	// SSH, when set, reaches the server through an SSH connection svidoq opens
+	// itself: host and port above are then the database's address as seen
+	// from the SSH host (often 127.0.0.1:3306), not from this machine.
+	SSH *SSH `yaml:"ssh"`
+
 	// Schemas overrides top-level schema entries for this environment only.
 	Schemas map[string]Schema `yaml:"schemas"`
+}
+
+// SSH is the host an environment's connections are forwarded through. The
+// forward is opened in-process for one command and closed when it ends; the
+// host key must already be in known_hosts, and nothing is ever written there.
+type SSH struct {
+	Host string `yaml:"host"`
+	Port int    `yaml:"port"`
+	User string `yaml:"user"`
+
+	// Key is a private key file; ~ is expanded. Optional when ssh-agent holds
+	// the key, which is then used to sign the login and never forwarded.
+	Key string `yaml:"key"`
+
+	// KnownHosts is the file the host key is checked against, default
+	// ~/.ssh/known_hosts. An unknown or changed key refuses the connection.
+	KnownHosts string `yaml:"known_hosts"`
+}
+
+// String names the SSH hop for display: user@host:port.
+func (s *SSH) String() string {
+	return fmt.Sprintf("%s@%s", s.User, net.JoinHostPort(s.Host, strconv.Itoa(s.Port)))
 }
 
 // Config is one profile.
@@ -116,6 +150,10 @@ type Target struct {
 	Limit       int
 	MaxLimit    int
 	Timeout     time.Duration
+
+	// SSH is the hop the connection is forwarded through, nil for a direct
+	// connection. Defaults are filled in.
+	SSH *SSH
 
 	// Display is the DSN with the password replaced, safe to print.
 	Display string
@@ -419,9 +457,18 @@ func (c *Config) target(e Environment, envName, schema string, s Schema) (*Targe
 		t.MaxLimit = t.Limit
 	}
 
+	if e.SSH != nil {
+		hop, err := resolveSSH(*e.SSH, subject)
+		if err != nil {
+			return nil, err
+		}
+
+		t.SSH = hop
+	}
+
 	if s.URL != "" {
 		t.DSN = s.URL
-		t.Display = redactDSN(t.DSN)
+		t.Display = withHop(redactDSN(t.DSN), t.SSH)
 
 		return t, nil
 	}
@@ -446,9 +493,39 @@ func (c *Config) target(e Environment, envName, schema string, s Schema) (*Targe
 	params := firstNonEmpty(s.Params, e.Params)
 
 	t.DSN = mysqlDSN(user, password, host, port, database, params)
-	t.Display = mysqlDSN(user, "", host, port, database, params)
+	t.Display = withHop(mysqlDSN(user, "", host, port, database, params), t.SSH)
 
 	return t, nil
+}
+
+// resolveSSH checks an ssh block and fills its defaults.
+func resolveSSH(s SSH, subject string) (*SSH, error) {
+	if s.Host == "" {
+		return nil, fmt.Errorf("%w: ssh block has no host for %s", ErrIncomplete, subject)
+	}
+
+	if s.User == "" {
+		return nil, fmt.Errorf("%w: ssh block has no user for %s", ErrIncomplete, subject)
+	}
+
+	if s.Port < 0 || s.Port > 65535 {
+		return nil, fmt.Errorf("%w: ssh port %d out of range for %s", ErrIncomplete, s.Port, subject)
+	}
+
+	s.Port = firstPositive(s.Port, DefaultSSHPort)
+	s.KnownHosts = firstNonEmpty(s.KnownHosts, DefaultKnownHosts)
+
+	return &s, nil
+}
+
+// withHop appends the SSH hop to a display DSN, so the target line says how
+// the server is reached and not only what it is called there.
+func withHop(display string, hop *SSH) string {
+	if hop == nil {
+		return display
+	}
+
+	return display + " via ssh " + hop.String()
 }
 
 // resolvePassword prefers, in order: the schema's password, then the

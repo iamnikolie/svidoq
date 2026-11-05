@@ -34,6 +34,16 @@ environments:
     limit: 200        # default rows per query
     max_limit: 5000   # ceiling for --limit
     timeout: 30s
+    # When the server listens only on another host, svidoq can forward through
+    # SSH itself. host and port above then name the database as that host sees
+    # it, usually 127.0.0.1 and 3306. The host key must already be in
+    # known_hosts; svidoq never adds one.
+    # ssh:
+    #   host: bastion.example.internal
+    #   user: tunnel
+    #   key: ~/.ssh/id_ed25519            # or ssh-agent
+    #   # port: 22
+    #   # known_hosts: ~/.ssh/known_hosts
 
   staging:
     host: db-staging.example.internal

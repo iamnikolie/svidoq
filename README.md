@@ -97,7 +97,7 @@ tar xzf svidoq_*_darwin_arm64.tar.gz
 sudo mv svidoq /usr/local/bin/
 ```
 
-**With Go** (1.24+):
+**With Go** (1.26+):
 
 ```bash
 go install github.com/iamnikolie/svidoq@latest
@@ -173,6 +173,48 @@ environment, never inherited by another, and it only dials plain names
 the connection. Pair it with a grant that is itself read-only: discovery widens
 what can be *named*, the server still decides what can be *read*.
 
+### Through an SSH host
+
+A database that listens only on its own server's loopback is usually reached
+through a tunnel someone opened first. svidoq can open it itself: give the
+environment an `ssh:` block, and every command forwards its connections through
+that host for as long as it runs, then closes the forward.
+
+```yaml
+environments:
+  dev:
+    host: 127.0.0.1                # the database, as seen from the SSH host
+    port: 3306
+    user: readonly
+    password_env: DEV_DB_PASSWORD
+    ssh:
+      host: bastion.internal
+      user: tunnel
+      key: ~/.ssh/id_ed25519       # optional when ssh-agent holds the key
+      # port: 22
+      # known_hosts: ~/.ssh/known_hosts
+```
+
+`host` and `port` keep naming the database; with `ssh:` they name it as the
+SSH host sees it. The tunnel is in-process (`golang.org/x/crypto/ssh`), and
+deliberately narrow:
+
+- **Strict host keys.** The SSH host's key must already be in `known_hosts`.
+  An unknown key is refused exactly like a changed one, the fingerprint is
+  printed so you can check it, and svidoq never writes to the file.
+- **Forwards only.** svidoq opens TCP forwards and nothing else — no shell, no
+  command, no agent forwarding. An account limited to forwarding (sshd
+  `PermitOpen 127.0.0.1:3306`, `ForceCommand /usr/sbin/nologin`) is all it
+  needs, and is what to give it.
+- **Bounded.** Connect, handshake and every forward share the connect timeout,
+  and a silent server cannot hold the handshake open.
+
+A passphrase-protected key needs ssh-agent or `SVIDOQ_SSH_PASSPHRASE`. The
+agent, when present, signs the login; it is never forwarded. The read-only
+layers do not change: a forward carries bytes, and every statement still goes
+through the parser and the read-only transaction, and `--timeout` and
+`KILL QUERY` work the same through the tunnel.
+
 There is deliberately **no default profile**: `--config` (or `SVIDOQ_CONFIG`)
 is required, so a command cannot quietly hit production because a stray DSN was
 lying around.
@@ -194,7 +236,8 @@ svidoq --config acme --env staging query billing "SELECT 1"
 svidoq --config acme --quiet --format tsv query billing "SELECT id FROM invoices LIMIT 10"
 ```
 
-Every query prints its resolved target to stderr and its data to stdout:
+Every query prints its resolved target to stderr and its data to stdout (with an
+`ssh:` block the line ends in `via ssh tunnel@bastion.internal:22`):
 
 ```
 → acme/prod/billing  readonly@tcp(db.internal:3306)/billing?parseTime=true
@@ -233,7 +276,7 @@ actually tested is claimed here.
 
 ```bash
 make test          # go test ./... — hermetic, no network, no database
-make integration   # spins up MySQL 8.4 and MariaDB 10.6 in Docker, runs the live suite on each
+make integration   # spins up MySQL 8.4 and MariaDB 10.6 in Docker, runs the live suite on each, directly and over SSH
 make vet
 make fmt
 make build
@@ -244,7 +287,10 @@ unless `SVIDOQ_TEST_DSN` is set, and it is the one that proves the second
 layer: it runs writes through the transaction *deliberately bypassing the
 validator* and asserts the server refuses them. It also checks that a timed-out
 statement is gone from `PROCESSLIST`, both via the server cap and via
-`KILL QUERY` alone.
+`KILL QUERY` alone. `SVIDOQ_TEST_VIA_SSH=1` runs the same suite through an
+in-process SSH server that permits only the database's address; the unit suite
+uses that server too, to check the tunnel refuses unknown and changed host keys
+and asks for nothing but forwards.
 
 ## Contributing
 
