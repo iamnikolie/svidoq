@@ -2,6 +2,8 @@ module github.com/iamnikolie/svidoq
 
 go 1.26.0
 
+toolchain go1.27.3
+
 require (
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/pingcap/tidb/pkg/parser v0.0.0-20260910125911-470dbf70499c
